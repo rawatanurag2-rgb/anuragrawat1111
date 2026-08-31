@@ -1,0 +1,13 @@
+{
+  "name": "rawat1111-dashboard",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@netlify/database": "^1.0.0",
+    "drizzle-orm": "beta"
+  },
+  "devDependencies": {
+    "@netlify/functions": "^3.0.0",
+    "drizzle-kit": "beta"
+  }
+}
