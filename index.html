@@ -134,6 +134,9 @@
           <option value="all_time">All Time</option>
         </select>
         <span id="saveStatus" class="text-[11px] text-emerald-600 font-semibold flex items-center gap-1"><i data-lucide="cloud" class="w-3.5 h-3.5"></i>Saved automatically</span>
+        <button onclick="manualRefresh()" title="Fetch the latest data added by anyone with this link" class="text-stone-500 hover:text-stone-800 p-1.5 rounded-lg hover:bg-stone-100">
+          <i data-lucide="refresh-cw" class="w-3.5 h-3.5"></i>
+        </button>
       </div>
       <button onclick="downloadPnL()" class="bg-stone-800 hover:bg-stone-900 text-white text-xs font-semibold px-3.5 py-2 rounded-xl flex items-center gap-1.5">
         <i data-lucide="download" class="w-3.5 h-3.5 text-amber-400"></i><span>Download Full Dashboard PDF</span>
@@ -570,41 +573,63 @@ let menuSeeded = false;
 let pendingLogoDataUri; // undefined = no change, null = remove custom logo, string = new logo data URI
 let monthlyChartInstance, yearlyChartInstance, channelChartInstance, expenseCategoryChartInstance;
 
-// Storage abstraction: uses Claude's artifact storage when available (inside Claude.ai),
-// and falls back to the browser's own localStorage when opened as a standalone file
-// (e.g. downloaded and opened directly, or hosted elsewhere) — so autosave always works.
-const LS_PREFIX = 'rawat1111_dash_';
-const localStorageOK = (function(){
-  try{ const k='__t__'; localStorage.setItem(k,'1'); localStorage.removeItem(k); return true; }catch(e){ return false; }
-})();
+// Storage abstraction: reads and writes go through a shared server-side API
+// (backed by a database) instead of this browser's own localStorage, so every
+// visitor to this same site link sees the same orders, expenses, menu and
+// settings — whoever added it, from whatever device.
 async function storageGet(key){
-  if(window.storage){
-    try{ return await window.storage.get(key, false); }catch(e){ /* fall through */ }
-  }
-  if(localStorageOK){
-    const v = localStorage.getItem(LS_PREFIX+key);
-    return v !== null ? {key, value:v} : null;
-  }
-  return null;
+  const res = await fetch('/api/state?key=' + encodeURIComponent(key));
+  if(!res.ok) throw new Error('Failed to load "' + key + '" (status ' + res.status + ')');
+  return await res.json();
 }
 async function storageSet(key, value){
-  if(window.storage){
-    try{ await window.storage.set(key, value, false); return true; }catch(e){ /* fall through to local */ }
-  }
-  if(localStorageOK){
-    localStorage.setItem(LS_PREFIX+key, value);
-    return true;
-  }
-  throw new Error('No storage available on this device/browser');
+  const res = await fetch('/api/state', {
+    method: 'PUT',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({key, value})
+  });
+  if(!res.ok) throw new Error('Failed to save "' + key + '" (status ' + res.status + ')');
+  return true;
 }
 
 async function loadAll(){
-  try{ const o = await storageGet('orders'); orders = o ? JSON.parse(o.value) : []; }catch(e){ orders = []; }
-  try{ const ex = await storageGet('expenses'); expenses = ex ? JSON.parse(ex.value) : []; }catch(e){ expenses = []; }
-  try{ const m = await storageGet('menu'); menu = m ? JSON.parse(m.value) : []; }catch(e){ menu = []; }
-  try{ const s = await storageGet('settings'); if(s) settings = JSON.parse(s.value); }catch(e){}
-  try{ const c = await storageGet('orderCounter'); if(c) orderCounter = JSON.parse(c.value); }catch(e){}
-  try{ const sd = await storageGet('menuSeeded'); menuSeeded = sd ? JSON.parse(sd.value) : false; }catch(e){ menuSeeded = false; }
+  let ok = true;
+  try{ const o = await storageGet('orders'); orders = o ? JSON.parse(o.value) : []; }catch(e){ orders = []; ok = false; }
+  try{ const ex = await storageGet('expenses'); expenses = ex ? JSON.parse(ex.value) : []; }catch(e){ expenses = []; ok = false; }
+  try{ const m = await storageGet('menu'); menu = m ? JSON.parse(m.value) : []; }catch(e){ menu = []; ok = false; }
+  try{ const s = await storageGet('settings'); if(s) settings = JSON.parse(s.value); }catch(e){ ok = false; }
+  try{ const c = await storageGet('orderCounter'); if(c) orderCounter = JSON.parse(c.value); }catch(e){ ok = false; }
+  try{ const sd = await storageGet('menuSeeded'); menuSeeded = sd ? JSON.parse(sd.value) : false; }catch(e){ menuSeeded = false; ok = false; }
+  return ok;
+}
+
+// Everyone who opens this link talks to the same shared storage, so anything
+// another person adds shows up here by re-loading it — automatically whenever
+// this tab regains focus/visibility, on a short interval while it's open, and
+// on demand via the refresh button. Skipped while a modal is open (so it can't
+// clobber an in-progress edit) or while the dashboard is locked.
+function isAnyModalOpen(){
+  return ['orderModal','expenseModal','menuModal','settingsModal'].some(id => {
+    const el = document.getElementById(id);
+    return el && !el.classList.contains('hidden');
+  });
+}
+async function refreshFromServer(){
+  if(isAnyModalOpen() || document.getElementById('app').classList.contains('hidden')) return;
+  const ok = await loadAll();
+  applySettings();
+  render();
+  lucide.createIcons();
+  if(!ok) await setStatus('Could not reach shared storage — showing last-loaded data', false);
+}
+async function manualRefresh(){
+  await setStatus('Refreshing...');
+  await refreshFromServer();
+}
+function startAutoRefresh(){
+  document.addEventListener('visibilitychange', () => { if(!document.hidden) refreshFromServer(); });
+  window.addEventListener('focus', refreshFromServer);
+  setInterval(refreshFromServer, 20000);
 }
 
 async function setStatus(msg, ok=true){
@@ -1326,18 +1351,19 @@ function lockDashboard(){
 }
 
 async function init(){
-  await loadAll();
+  const ok = await loadAll();
   if(seedMenuIfEmpty()){ await persistMenu(); await persist('menuSeeded', true); }
   applySettings();
   document.getElementById('orderDate').value = new Date().toISOString().slice(0,10);
   document.getElementById('expenseDate').value = new Date().toISOString().slice(0,10);
   render();
-  if(!window.storage && !localStorageOK){
-    await setStatus('Storage unavailable in this browser — changes won\'t be saved', false);
+  if(!ok){
+    await setStatus('Could not reach shared storage — showing last-loaded data', false);
   }
   lucide.createIcons();
   document.getElementById('loadingScreen').classList.add('hidden');
   document.getElementById('lockScreen').classList.remove('hidden');
+  startAutoRefresh();
 }
 init();
 </script>
